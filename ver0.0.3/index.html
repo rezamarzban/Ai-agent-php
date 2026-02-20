@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<!-- ================================================ -->
+<!-- ai.html   (Frontend - Realtime tokens + speed)   -->
+<!-- ================================================ -->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Cloud AI Agent • Realtime Tools</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; }
+        .chat { scrollbar-width: thin; }
+        .message { animation: fadeIn 0.2s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="max-w-4xl mx-auto p-4">
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-3xl font-bold text-gray-800">🌐 Custom Cloud AI Agent</h1>
+            <button onclick="clearChat()" class="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-medium">Clear Chat</button>
+        </div>
+
+        <div id="chat" class="chat bg-white border border-gray-200 rounded-2xl h-[70vh] overflow-y-auto p-6 space-y-6"></div>
+
+        <div class="mt-6 flex gap-3">
+            <textarea id="input" rows="3"
+                class="flex-1 resize-y border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="Ask anything... e.g. Search web for latest AI news or Generate graphic art of a futuristic city"></textarea>
+            <button onclick="sendMessage()" class="bg-blue-600 hover:bg-blue-700 text-white px-8 rounded-xl font-medium">Send</button>
+        </div>
+
+        <div class="text-center text-gray-400 text-xs mt-4">
+            Any OpenAI-compatible cloud • Full parallel tool calling • Realtime streaming + tokens/s
+        </div>
+    </div>
+
+    <script>
+        const chat = document.getElementById('chat');
+        let currentAssistantDiv = null;
+        let tokenCount = 0;
+        let startTime = null;
+        let speedInterval = null;
+
+        function scrollToBottom() { chat.scrollTop = chat.scrollHeight; }
+
+        function addMessage(role, content = '', extra = {}) {
+            const div = document.createElement('div');
+            div.className = `message flex ${role === 'user' ? 'justify-end' : 'justify-start'}`;
+
+            if (role === 'user') {
+                div.innerHTML = `<div class="max-w-[80%] bg-blue-600 text-white px-5 py-3 rounded-2xl rounded-tr-none"><strong>You:</strong><br>${content.replace(/\n/g, '<br>')}</div>`;
+            } else if (role === 'assistant') {
+                div.innerHTML = `
+                    <div class="max-w-[80%] bg-gray-100 px-5 py-3 rounded-2xl rounded-tl-none">
+                        <strong class="text-emerald-600">AI:</strong>
+                        <div class="assistant-content mt-1 text-gray-800 whitespace-pre-wrap"></div>
+                        <div class="speed text-xs text-gray-400 mt-1"></div>
+                    </div>`;
+            } else if (role === 'tool') {
+                div.innerHTML = `
+                    <div class="max-w-[80%] bg-amber-50 border border-amber-200 px-5 py-3 rounded-2xl text-sm">
+                        <strong class="text-amber-700">🔧 ${extra.name}</strong>
+                        <pre class="mt-2 text-xs bg-white p-3 rounded overflow-auto">${JSON.stringify(extra.result, null, 2)}</pre>
+                        ${extra.result?.image_url ? `<img src="${extra.result.image_url}" class="mt-3 max-w-xs rounded border shadow">` : ''}
+                    </div>`;
+            }
+            chat.appendChild(div);
+            scrollToBottom();
+            return div;
+        }
+
+        function updateSpeed() {
+            if (!startTime || tokenCount < 3) return;
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speed = (tokenCount / elapsed).toFixed(1);
+            if (currentAssistantDiv) currentAssistantDiv.querySelector('.speed').textContent = `(${speed} tokens/s)`;
+        }
+
+        async function loadHistory() {
+            const res = await fetch('api.php');
+            const history = await res.json();
+            chat.innerHTML = '';
+            history.forEach(msg => {
+                if (msg.role === 'user') addMessage('user', msg.content);
+                else if (msg.role === 'assistant') {
+                    const d = addMessage('assistant', msg.content || '', {tool_calls: msg.tool_calls});
+                    if (msg.content) d.querySelector('.assistant-content').textContent = msg.content;
+                } else if (msg.role === 'tool') {
+                    try { addMessage('tool', '', {name: msg.name, result: JSON.parse(msg.content)}); } catch(e){}
+                }
+            });
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('input');
+            const text = input.value.trim();
+            if (!text) return;
+
+            addMessage('user', text);
+            input.value = '';
+
+            const res = await fetch('api.php', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: text})
+            });
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            currentAssistantDiv = null;
+            tokenCount = 0;
+            startTime = null;
+            if (speedInterval) clearInterval(speedInterval);
+
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, {stream: true});
+                const events = buffer.split('\n\n');
+                buffer = events.pop() || '';
+
+                for (let event of events) {
+                    event = event.trim();
+                    if (!event.startsWith('data: ')) continue;
+                    let data;
+                    try { data = JSON.parse(event.substring(6).trim()); } catch(e) { continue; }
+
+                    if (data.type === 'assistant_start') {
+                        currentAssistantDiv = addMessage('assistant', '');
+                        tokenCount = 0;
+                        startTime = Date.now();
+                        speedInterval = setInterval(updateSpeed, 300);
+                    }
+                    else if (data.type === 'token' && currentAssistantDiv) {
+                        currentAssistantDiv.querySelector('.assistant-content').textContent += data.token;
+                        tokenCount++;
+                        scrollToBottom();
+                    }
+                    else if (data.type === 'tool_call_detected' && currentAssistantDiv) {
+                        const contentDiv = currentAssistantDiv.querySelector('.assistant-content');
+                        let html = `<span class="text-amber-600 font-medium">🛠️ Calling tools...</span><br>`;
+                        data.calls.forEach(c => {
+                            html += `<code class="text-xs bg-amber-100 px-2 py-1 rounded block my-1">${c.function.name}(${c.function.arguments})</code>`;
+                        });
+                        contentDiv.innerHTML = html;
+                    }
+                    else if (data.type === 'tool_result') {
+                        addMessage('tool', '', {name: data.name, result: data.result});
+                    }
+                    else if (data.type === 'done') {
+                        if (speedInterval) clearInterval(speedInterval);
+                        updateSpeed();
+                    }
+                }
+            }
+        }
+
+        async function clearChat() {
+            if (!confirm('Clear entire chat?')) return;
+            await fetch('api.php', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({clear: true})});
+            chat.innerHTML = '';
+            loadHistory();
+        }
+
+        window.onload = () => {
+            loadHistory();
+            document.getElementById('input').addEventListener('keydown', e => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+            });
+        };
+    </script>
+</body>
+</html>
