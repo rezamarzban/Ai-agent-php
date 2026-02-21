@@ -1,6 +1,6 @@
 <?php
 // ================================================
-// api.php   (UPDATED - Smart system prompt, no unnecessary tools)
+// api.php   (FIXED - Clear chat now works perfectly)
 // ================================================
 session_start();
 
@@ -28,7 +28,7 @@ if (!isset($_SESSION['history'])) {
     ];
 }
 
-// Fallback parser (if model still prints JSON in content)
+// Fallback parser
 function extract_tool_calls_from_text($content) {
     if (empty($content)) return null;
     $calls = [];
@@ -50,7 +50,6 @@ function extract_tool_calls_from_text($content) {
     return $calls ?: null;
 }
 
-// Non-realtime model call (unchanged)
 function stream_model($messages) {
     global $TOOLS_SCHEMAS;
 
@@ -175,6 +174,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true) ?? $_POST;
+
+    // ← CLEAR CHECK FIRST (this was the bug)
+    if (!empty($input['clear'])) {
+        unset($_SESSION['history']);
+        header('Content-Type: application/json');
+        echo json_encode(["status" => "cleared"]);
+        exit;
+    }
+
     $user = trim($input['message'] ?? '');
 
     if (empty($user)) {
@@ -183,17 +191,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    if (!empty($input['clear'])) {
-        unset($_SESSION['history']);
-        header('Content-Type: application/json');
-        echo json_encode(["status" => "cleared"]);
-        exit;
-    }
-
     $_SESSION['history'][] = ["role" => "user", "content" => $user];
 
     $step = 0;
-    $max_steps = 8;   // slightly reduced
+    $max_steps = 8;
 
     while ($step < $max_steps) {
         $step++;
@@ -205,7 +206,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $tool_calls = $assistant_msg['tool_calls'] ?? [];
         $function_call = $assistant_msg['function_call'] ?? null;
 
-        // Fallback parser
         if (empty($tool_calls) && !empty($assistant_msg['content'])) {
             $extracted = extract_tool_calls_from_text($assistant_msg['content']);
             if ($extracted) {
@@ -217,7 +217,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if (empty($tool_calls) && !$function_call) {
-            break;   // normal final answer
+            break;
         }
 
         if (!empty($tool_calls)) {
