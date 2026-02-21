@@ -1,6 +1,6 @@
 <?php
 // ================================================
-// api.php   (Backend with realtime SSE + strong tool forcing + fallback parser)
+// api.php   (UPDATED - Smart system prompt, no unnecessary tools)
 // ================================================
 session_start();
 
@@ -8,21 +8,27 @@ require_once 'config.php';
 require_once 'search_web_tool.php';
 require_once 'graphic_art_tool.php';
 
-// Collect all tool schemas from the individual *_tool.php files
 global $TOOL_SCHEMAS;
 $TOOLS_SCHEMAS = $TOOL_SCHEMAS ?? [];
 
-// Strong system prompt
+// Improved smart system prompt
 if (!isset($_SESSION['history'])) {
     $_SESSION['history'] = [
         [
             "role" => "system",
-            "content" => "You are a helpful assistant. You MUST use tools via the exact 'tool_calls' format whenever the user asks for information or actions that tools can provide. Never answer from internal knowledge if a tool exists. Output ONLY the tool_calls — no extra text. After receiving tool results, answer using ONLY those results."
+            "content" => "You are a helpful, friendly AI assistant.
+
+- For greetings, introductions, self-explanation, or general knowledge questions: answer directly from your knowledge. Do NOT call any tools.
+- Use the 'search_web' tool ONLY when the user explicitly asks to search the web or needs current/external information.
+- Use the 'graphic_art' tool ONLY when the user asks to generate graphic art or an image.
+- Never call tools for normal conversation.
+- When you decide to use a tool, output ONLY the tool_calls in the correct format - no extra text.
+- After receiving tool results, give a clear final answer based on them."
         ]
     ];
 }
 
-// Fallback: extract tool calls if model prints JSON in content
+// Fallback parser (if model still prints JSON in content)
 function extract_tool_calls_from_text($content) {
     if (empty($content)) return null;
     $calls = [];
@@ -44,8 +50,9 @@ function extract_tool_calls_from_text($content) {
     return $calls ?: null;
 }
 
-function stream_model($messages, $live = false) {
-    global $TOOLS_SCHEMAS;   // ← now comes from the *_tool.php files
+// Non-realtime model call (unchanged)
+function stream_model($messages) {
+    global $TOOLS_SCHEMAS;
 
     $payload = [
         "model" => MODEL,
@@ -71,7 +78,7 @@ function stream_model($messages, $live = false) {
     ]);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
     curl_setopt($ch, CURLOPT_TIMEOUT, TIMEOUT);
-    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($curl, $data) use (&$accumulated_content, &$accumulated_tool_calls, &$accumulated_function_call, $live) {
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($curl, $data) use (&$accumulated_content, &$accumulated_tool_calls, &$accumulated_function_call) {
         static $buffer = '';
         $buffer .= $data;
 
@@ -90,12 +97,7 @@ function stream_model($messages, $live = false) {
             $delta = $chunk["choices"][0]["delta"];
 
             if (isset($delta["content"]) && $delta["content"] !== null) {
-                $token = $delta["content"];
-                $accumulated_content .= $token;
-                if ($live) {
-                    echo "data: " . json_encode(["type" => "token", "token" => $token]) . "\n\n";
-                    ob_flush(); flush();
-                }
+                $accumulated_content .= $delta["content"];
             }
 
             if (isset($delta["tool_calls"]) && is_array($delta["tool_calls"])) {
@@ -133,9 +135,7 @@ function stream_model($messages, $live = false) {
     curl_close($ch);
 
     if (!$success) {
-        $error = "Connection failed";
-        if ($live) echo "data: " . json_encode(["type" => "error", "message" => $error]) . "\n\n";
-        return ["role" => "assistant", "content" => "[Error: {$error}]"];
+        return ["role" => "assistant", "content" => "[Connection error]"];
     }
 
     $accumulated_content = trim(str_replace(["ð", "�"], "", $accumulated_content));
@@ -175,33 +175,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true) ?? $_POST;
+    $user = trim($input['message'] ?? '');
 
-    if (!empty($input['clear'])) {
-        unset($_SESSION['history']);
-        echo "data: " . json_encode(["type" => "cleared"]) . "\n\n";
+    if (empty($user)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Empty message"]);
         exit;
     }
 
-    $user = trim($input['message'] ?? '');
-    if (empty($user)) exit;
-
-    header('Content-Type: text/event-stream');
-    header('Cache-Control: no-cache');
-    header('Connection: keep-alive');
-    header('X-Accel-Buffering: no');
+    if (!empty($input['clear'])) {
+        unset($_SESSION['history']);
+        header('Content-Type: application/json');
+        echo json_encode(["status" => "cleared"]);
+        exit;
+    }
 
     $_SESSION['history'][] = ["role" => "user", "content" => $user];
 
     $step = 0;
-    $max_steps = 10;
+    $max_steps = 8;   // slightly reduced
 
     while ($step < $max_steps) {
         $step++;
 
-        echo "data: " . json_encode(["type" => "assistant_start"]) . "\n\n";
-        ob_flush(); flush();
+        $assistant_msg = stream_model($_SESSION['history']);
 
-        $assistant_msg = stream_model($_SESSION['history'], true);
         $_SESSION['history'][] = $assistant_msg;
 
         $tool_calls = $assistant_msg['tool_calls'] ?? [];
@@ -218,10 +216,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
-        if (empty($tool_calls) && !$function_call) break;
-
-        echo "data: " . json_encode(["type" => "tool_call_detected", "calls" => $tool_calls]) . "\n\n";
-        ob_flush(); flush();
+        if (empty($tool_calls) && !$function_call) {
+            break;   // normal final answer
+        }
 
         if (!empty($tool_calls)) {
             foreach ($tool_calls as $tc) {
@@ -236,14 +233,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     "content" => json_encode($result, JSON_UNESCAPED_SLASHES)
                 ];
                 $_SESSION['history'][] = $tool_msg;
-
-                echo "data: " . json_encode(["type" => "tool_result", "name" => $fname, "result" => $result]) . "\n\n";
-                ob_flush(); flush();
             }
         }
     }
 
-    echo "data: " . json_encode(["type" => "done"]) . "\n\n";
+    header('Content-Type: application/json');
+    echo json_encode($_SESSION['history']);
     exit;
 }
 ?>
